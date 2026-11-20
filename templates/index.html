@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peramalan Harga Bitcoin dengan LSTM</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f6f7fb; --card:#fff; --text:#1d2433; --muted:#6b7385; --accent:#d97706; --line:#e3e6ee; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151c; --card:#1b1f2a; --text:#e8ebf3; --muted:#9aa3b8; --accent:#fbbf24; --line:#2b3140; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Times New Roman", Times, serif; background:var(--bg); color:var(--text); line-height:1.5; }
+  header { padding:28px 20px 8px; max-width:1100px; margin:0 auto; }
+  h1 { margin:0 0 4px; font-size:1.8rem; }
+  .sub { color:var(--muted); margin:0; }
+  main { max-width:1100px; margin:0 auto; padding:12px 20px 40px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin:16px 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .metric .v { font-size:1.5rem; font-weight:bold; color:var(--accent); }
+  .metric .l { color:var(--muted); font-size:.88rem; }
+  h2 { font-size:1.2rem; margin:0 0 10px; }
+  .chartbox { position:relative; height:320px; }
+  select { font-family:inherit; font-size:1rem; padding:4px 8px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  table { width:100%; border-collapse:collapse; margin-top:10px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  footer { color:var(--muted); font-size:.85rem; max-width:1100px; margin:0 auto; padding:0 20px 30px; }
+  .row { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+  .note { color:var(--muted); font-size:.9rem; margin:6px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Peramalan Harga Penutupan Bitcoin (BTC-USD)</h1>
+  <p class="sub">Model LSTM berbasis log-return &middot; data {{ meta.data_start }} s.d. {{ meta.data_end }} &middot; {{ meta.n_days }} hari</p>
+</header>
+<main>
+  <section class="grid">
+    <div class="card metric"><div class="v">${{ "{:,.2f}".format(meta.metrics.rmse) }}</div><div class="l">RMSE LSTM (data uji)</div></div>
+    <div class="card metric"><div class="v">${{ "{:,.2f}".format(meta.metrics.mae) }}</div><div class="l">MAE LSTM</div></div>
+    <div class="card metric"><div class="v">{{ "%.2f"|format(meta.metrics.mape) }}%</div><div class="l">MAPE LSTM</div></div>
+    <div class="card metric"><div class="v">${{ "{:,.2f}".format(meta.metrics.naive_rmse) }}</div><div class="l">RMSE baseline (harga kemarin)</div></div>
+    <div class="card metric"><div class="v">{{ "%.1f"|format(meta.metrics.direction_acc) }}%</div><div class="l">Akurasi arah naik/turun</div></div>
+  </section>
+
+  <section class="card">
+    <div class="row"><h2>Harga Historis</h2>
+      <span>
+        <label>Skala <select id="scale"><option value="linear">Linear</option><option value="logarithmic" selected>Logaritmik</option></select></label>
+        <label>Tampilkan <select id="histRange"><option value="180">6 bulan terakhir</option><option value="365">1 tahun terakhir</option><option value="0" selected>Semua data</option></select></label>
+      </span></div>
+    <div class="chartbox"><canvas id="histChart"></canvas></div>
+  </section>
+
+  <section class="card" style="margin-top:12px">
+    <h2>Aktual vs Prediksi LSTM (Data Uji)</h2>
+    <div class="chartbox"><canvas id="evalChart"></canvas></div>
+  </section>
+
+  <section class="card" style="margin-top:12px">
+    <div class="row"><h2>Peramalan ke Depan</h2>
+      <label>Horizon <select id="days">
+        {% for d in [3,5,7,10,14] if d <= max_days %}<option value="{{ d }}" {{ 'selected' if d==7 }}>{{ d }} hari</option>{% endfor %}
+      </select></label></div>
+    <p class="note">Data berakhir pada {{ meta.data_end }}, sehingga peramalan dimulai dari hari setelahnya (bukan harga pasar saat ini).</p>
+    <div class="chartbox"><canvas id="fcChart"></canvas></div>
+    <table id="fcTable"><thead><tr><th>Tanggal</th><th>Prediksi Harga (USD)</th><th>Perkiraan Return (%)</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+<footer>
+  Hanya untuk keperluan akademik, bukan saran investasi. Harga kripto sangat fluktuatif dan peramalan multi-hari dilakukan secara rekursif sehingga galat menumpuk.
+  Dataset: Cryptocurrency Historical Prices (Kaggle, sudalairajkumar). Proyek Praktikum Pembelajaran Mesin &ndash; Daegal Fauzan Kadafi (301240005).
+</footer>
+
+<script>
+const css = getComputedStyle(document.documentElement);
+const C = { accent: css.getPropertyValue('--accent').trim(), text: css.getPropertyValue('--text').trim(), line: css.getPropertyValue('--line').trim() };
+Chart.defaults.color = C.text; Chart.defaults.font.family = '"Times New Roman", serif';
+const usd = v => '$' + Number(v).toLocaleString('en-US', {maximumFractionDigits: 2});
+function opts(type){ return { responsive:true, maintainAspectRatio:false, animation:false, interaction:{mode:'index',intersect:false},
+  elements:{point:{radius:0}}, plugins:{tooltip:{callbacks:{label:c=>c.dataset.label+': '+usd(c.parsed.y)}}},
+  scales:{ x:{ticks:{maxTicksLimit:10},grid:{color:C.line}}, y:{type:type||'linear',title:{display:true,text:'Harga (USD)'},grid:{color:C.line}} } }; }
+async function getJSON(u){ const r = await fetch(u); if(!r.ok) throw new Error((await r.json()).error||r.status); return r.json(); }
+
+let hist, histChart;
+function drawHist(){
+  const n = parseInt(document.getElementById('histRange').value), s = n ? hist.dates.length - n : 0;
+  const type = document.getElementById('scale').value;
+  if(histChart) histChart.destroy();
+  histChart = new Chart('histChart',{type:'line',data:{labels:hist.dates.slice(s),datasets:[{label:'Harga penutupan',data:hist.values.slice(s),borderColor:C.accent,borderWidth:1.5}]},options:opts(type)});
+}
+async function drawEval(){
+  const e = await getJSON('/api/evaluation');
+  new Chart('evalChart',{type:'line',data:{labels:e.dates,datasets:[
+    {label:'Aktual',data:e.actual,borderColor:'#3b82f6',borderWidth:1.5},
+    {label:'Prediksi LSTM',data:e.predicted,borderColor:'#f59e0b',borderWidth:1.2},
+    {label:'Baseline (harga kemarin)',data:e.naive,borderColor:'#9ca3af',borderWidth:1,borderDash:[4,3]}]},options:opts('linear')});
+}
+let fcChart;
+async function drawForecast(){
+  const f = await getJSON('/api/forecast?days='+document.getElementById('days').value);
+  const labels = f.recent_dates.concat(f.dates), n = f.recent_dates.length;
+  const actual = f.recent_prices.concat(f.dates.map(()=>null));
+  const pred = f.recent_dates.map((_,i)=> i===n-1 ? f.recent_prices[n-1] : null).concat(f.prices);
+  if(fcChart) fcChart.destroy();
+  fcChart = new Chart('fcChart',{type:'line',data:{labels,datasets:[
+    {label:'Aktual (30 hari terakhir)',data:actual,borderColor:'#3b82f6',borderWidth:1.5},
+    {label:'Prediksi',data:pred,borderColor:'#10b981',borderWidth:2,pointRadius:3}]},options:opts('linear')});
+  document.querySelector('#fcTable tbody').innerHTML = f.dates.map((t,i)=>`<tr><td>${t}</td><td>${usd(f.prices[i])}</td><td>${f.returns_pct[i].toFixed(3)}</td></tr>`).join('');
+}
+(async()=>{
+  hist = await getJSON('/api/history'); drawHist(); drawEval(); drawForecast();
+  document.getElementById('histRange').onchange = drawHist;
+  document.getElementById('scale').onchange = drawHist;
+  document.getElementById('days').onchange = drawForecast;
+})();
+</script>
+</body>
+</html>
